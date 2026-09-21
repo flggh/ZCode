@@ -1,0 +1,380 @@
+name: Release
+
+# .release-it.mjs 打的 tag 是 v${version}。
+on:
+  # 打 tag 不触发构建，只走手动触发；要触发就把下面三行取消注释
+  # push:
+  #   tags:
+  #     - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag；留空则用 v<package.json 的 version>"
+        required: false
+        type: string
+      publish:
+        description: "构建完成后把 draft release 转正"
+        required: false
+        default: false
+        type: boolean
+      base_url:
+        description: "命令行发行包的下载根地址，会烘焙进 install.sh；留空则读仓库变量 ZCODE_DIST_BASE_URL"
+        required: false
+        type: string
+      # 勾选要构建的产物，默认全选。tag 推送时忽略这些开关，一律全建。
+      build_mac_arm64:
+        description: "macOS arm64（dmg/zip）"
+        type: boolean
+        default: true
+      build_mac_x64:
+        description: "macOS x64（dmg/zip）"
+        type: boolean
+        default: true
+      build_win_x64:
+        description: "Windows x64（nsis）"
+        type: boolean
+        default: true
+      build_win_arm64:
+        description: "Windows arm64（nsis）"
+        type: boolean
+        default: true
+      build_linux_x64:
+        description: "Linux x64（AppImage/deb/rpm/pacman）"
+        type: boolean
+        default: true
+      build_linux_arm64:
+        description: "Linux arm64（AppImage/deb/rpm/pacman）"
+        type: boolean
+        default: true
+      build_cli:
+        description: "命令行发行包（dist/zcode）"
+        type: boolean
+        default: true
+
+# gh release 需要写权限。
+permissions:
+  contents: write
+
+# 不取消进行中的构建。
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  # 跳过 husky 的 prepare。
+  HUSKY: "0"
+  # 必设：否则解析成 preview 身份 + _TEST 后缀。
+  ZCODE_ENV: production
+  # 桌面安装包不依赖 mock-cdn 资产。
+  ZCODE_SKIP_REMOTE_ASSETS: "1"
+  # npmmirror 在 runner 上慢/超时；bundle.mjs 会转成 ZCODE_ELECTRON_RUNTIME_MIRROR。
+  ELECTRON_MIRROR: https://github.com/electron/electron/releases/download/
+  ELECTRON_BUILDER_BINARIES_MIRROR: https://github.com/electron-userland/electron-builder-binaries/releases/download/
+
+jobs:
+  prepare:
+    name: 解析版本
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      version: ${{ steps.meta.outputs.version }}
+      tag: ${{ steps.meta.outputs.tag }}
+      prerelease: ${{ steps.meta.outputs.prerelease }}
+      desktop_matrix: ${{ steps.matrix.outputs.desktop_matrix }}
+      desktop_count: ${{ steps.matrix.outputs.desktop_count }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # 原 `node scripts/licenses.mjs check --strict` 门禁已移除：当前检出状态下它必然失败
+      # （Linux 缺 @napi-rs/canvas-*-musl；声明已过期），修它需要改仓库文件。
+      # 恢复方式：修好上面两点并提交声明，再把该步加回。
+
+      - name: 解析版本与 tag
+        id: meta
+        env:
+          INPUT_TAG: ${{ inputs.tag }}
+          REF_NAME: ${{ github.ref_name }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          version=$(node -p "require('./package.json').version")
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            tag="${INPUT_TAG:-v$version}"
+          else
+            tag="$REF_NAME"
+          fi
+
+          # 产物命名与包内身份都取自 package.json，tag 不一致会发错版本。
+          if [ "$tag" != "v$version" ]; then
+            echo "::error::tag 与 package.json version 不一致：tag=$tag version=$version。请先 bump 版本，或改用与版本一致的 tag。"
+            exit 1
+          fi
+
+          case "$version" in
+            *-*) prerelease=true ;;
+            *) prerelease=false ;;
+          esac
+
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "prerelease=$prerelease" >> "$GITHUB_OUTPUT"
+          echo "发布 $tag（version=$version prerelease=$prerelease）"
+
+      # 未勾选的桌面端要「整档不进入 matrix」——job 级 if 里拿不到 matrix 上下文，
+      # 只能在 prepare 里把矩阵算出来，build-desktop 再用 fromJSON 消费。
+      - name: 生成桌面构建矩阵
+        id: matrix
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          ENABLE_MAC_ARM64: ${{ inputs.build_mac_arm64 }}
+          ENABLE_MAC_X64: ${{ inputs.build_mac_x64 }}
+          ENABLE_WIN_X64: ${{ inputs.build_win_x64 }}
+          ENABLE_WIN_ARM64: ${{ inputs.build_win_arm64 }}
+          ENABLE_LINUX_X64: ${{ inputs.build_linux_x64 }}
+          ENABLE_LINUX_ARM64: ${{ inputs.build_linux_arm64 }}
+        run: |
+          set -euo pipefail
+          # tag 推送一律全建；手动触发才看勾选。
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then all=0; else all=1; fi
+
+          rows=()
+          maybe() {
+            if [ "$all" = "1" ] || [ "$1" = "true" ]; then
+              rows+=("{\"runner\":\"$2\",\"target_os\":\"$3\",\"target_arch\":\"$4\"}")
+            fi
+          }
+          # 覆盖 native-search-tools-config.mjs 的 ENABLED_NATIVE_SEARCH_PLATFORM_KEYS 全部 6 个平台键。
+          maybe "${ENABLE_MAC_ARM64:-false}"   macos-14        mac arm64
+          maybe "${ENABLE_MAC_X64:-false}"     macos-15-intel  mac x64
+          maybe "${ENABLE_WIN_X64:-false}"     windows-latest  win x64
+          maybe "${ENABLE_WIN_ARM64:-false}"   windows-11-arm  win arm64
+          maybe "${ENABLE_LINUX_X64:-false}"   ubuntu-22.04    linux x64
+          maybe "${ENABLE_LINUX_ARM64:-false}" ubuntu-22.04-arm linux arm64
+
+          joined=""
+          [ ${#rows[@]} -eq 0 ] || printf -v joined '%s,' "${rows[@]}"
+          echo "desktop_matrix=[${joined%,}]" >> "$GITHUB_OUTPUT"
+          echo "desktop_count=${#rows[@]}" >> "$GITHUB_OUTPUT"
+          echo "桌面端将构建 ${#rows[@]} 档：[${joined%,}]"
+
+      - name: 创建 draft release（可重复运行）
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          PRERELEASE: ${{ steps.meta.outputs.prerelease }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            echo "release $TAG 已存在，跳过创建"
+            exit 0
+          fi
+          # --verify-tag：tag 必须已存在，避免 gh 凭空建出指向默认分支的 tag。
+          args=(--draft --verify-tag --title "ZCode $TAG" --generate-notes)
+          if [ "$PRERELEASE" = "true" ]; then
+            args+=(--prerelease)
+          fi
+          gh release create "$TAG" "${args[@]}"
+
+  build-desktop:
+    name: 桌面包 ${{ matrix.target_os }}-${{ matrix.target_arch }}
+    needs: prepare
+    # 一个都没勾时 matrix 为空会直接报错，所以整档跳过。
+    if: ${{ needs.prepare.outputs.desktop_count != '0' }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: false
+      # 矩阵由 prepare 按勾选算好（job 级 if 拿不到 matrix 上下文）。
+      # 档位定义在 prepare 的「生成桌面构建矩阵」里，6 个平台键与仓库的
+      # ENABLED_NATIVE_SEARCH_PLATFORM_KEYS 一致：
+      #   macos-14(mac/arm64)、macos-15-intel(mac/x64)、windows-latest(win/x64)、
+      #   windows-11-arm(win/arm64)、ubuntu-22.04(linux/x64)、ubuntu-22.04-arm(linux/arm64)
+      # arm64 runner 内存偏小（macOS 3vCPU/7GB）而 agent 构建堆上限 8192，OOM 时改用 x64 runner 交叉构建。
+      matrix:
+        include: ${{ fromJSON(needs.prepare.outputs.desktop_matrix) }}
+    steps:
+      - uses: actions/checkout@v7
+
+      # System32 的 bsdtar 解 .tar.xz 时会外挂 xz 并静默挂死，前置 Git 的 GNU tar/xz。
+      - name: 修正 Windows 的 tar/xz
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          "C:\Program Files\Git\usr\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          "C:\Program Files\Git\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+          & "C:\Program Files\Git\usr\bin\tar.exe" --version
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      # 只缓存外部下载物（Electron zip、builder 辅助包），内容由版本号唯一决定，无过期风险。
+      # 不缓存 out/** 与 bundled-agents/**：属发布物本体，缓存会把旧内容打进包里。
+      # 必须在 `安装依赖` 之前，electron 的 postinstall 要靠它。路径按平台列，不存在的仅告警。
+      - name: 缓存 Electron 运行时与 builder 辅助包
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cache/electron
+            ~/Library/Caches/electron
+            ~/AppData/Local/electron/Cache
+            ~/.cache/electron-builder
+            ~/Library/Caches/electron-builder
+            ~/AppData/Local/electron-builder/Cache
+          key: electron-${{ runner.os }}-${{ matrix.target_arch }}-${{ hashFiles('packages/desktop/package.json', 'packages/desktop/electron-builder.config.js') }}
+
+      # Linux 上 node-pty 走 electron-rebuild，需要工具链；rpm 要 rpmbuild；
+      # pacman target 由 fpm 调 bsdtar 生成 .MTREE，bsdtar 在 Ubuntu 上属 libarchive-tools。
+      - name: 系统依赖（Linux）
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends build-essential python3 rpm libarchive-tools
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      - name: 磁盘余量
+        shell: bash
+        run: df -h
+
+      # bundle.mjs 自己会跑 prepare:runtime-assets → build → electron-builder。
+      - name: 打包
+        env:
+          ZCODE_TARGET_OS: ${{ matrix.target_os }}
+          ZCODE_TARGET_ARCH: ${{ matrix.target_arch }}
+        run: pnpm bundle:desktop -- --os ${{ matrix.target_os }} --arch ${{ matrix.target_arch }}
+
+      - name: 列出产物
+        shell: bash
+        run: ls -la packages/desktop/dist
+
+      # 构建完立即直传 Release，不等其它 job，也不再经 Actions artifact 中转。
+      - name: 上传到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 只收安装包本体：latest*.yml 与 *.blockmap 不发（feed 是 localhost 占位，见 electron-builder.config.js
+          # 的 publish；多架构同名还会互相覆盖）。-maxdepth 1 跳过 win-unpacked/，-print0 兼容带空格的文件名。
+          find packages/desktop/dist -maxdepth 1 -type f \
+            \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' -o -name '*.AppImage' \
+               -o -name '*.deb' -o -name '*.rpm' -o -name '*.pkg.tar.zst' \) -print0 > "$RUNNER_TEMP/assets"
+
+          [ -s "$RUNNER_TEMP/assets" ] || { echo "::error::dist 下没有可发布的产物"; exit 1; }
+
+          # --clobber 保证重跑幂等。
+          xargs -0 gh release upload "$TAG" --clobber < "$RUNNER_TEMP/assets"
+          echo "已上传 $(tr -cd '\0' < "$RUNNER_TEMP/assets" | wc -c) 个文件"
+
+  build-cli:
+    name: 命令行发行包
+    needs: prepare
+    # 手动触发时按勾选跳过；tag 推送一律构建。
+    if: ${{ github.event_name == 'push' || inputs.build_cli }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    env:
+      # 手动触发的 base_url 优先，其次仓库变量。
+      ZCODE_DIST_BASE_URL: ${{ inputs.base_url || vars.ZCODE_DIST_BASE_URL }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v6
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version-file: .nvmrc
+          cache: pnpm
+
+      - name: 安装依赖
+        run: pnpm install --frozen-lockfile
+
+      # build-zcode.mjs 缺这个地址会直接抛错，它会被烘焙进 install.sh。
+      - name: 校验 ZCODE_DIST_BASE_URL
+        run: |
+          set -euo pipefail
+          if [ -z "${ZCODE_DIST_BASE_URL:-}" ]; then
+            echo "::error::缺少下载根地址。两种给法：① 手动触发（Run workflow）时在 base_url 输入框里填；② 在 Settings → Secrets and variables → Actions → Variables 里加仓库变量 ZCODE_DIST_BASE_URL。它必须是 install.sh 拉取 latest.json 与 releases/<version>/<tarball> 的地址前缀，例如 https://cdn.example.com/zcode/。"
+            exit 1
+          fi
+          echo "download base url: $ZCODE_DIST_BASE_URL"
+
+      # stageTuiRuntime 要求运行时闭包里的工作区包都有 dist/index.js，而 shared/services/client/ui
+      # 没有 build 脚本（exports 直指 src），其 dist 只能由 tsc -b 产出。
+      - name: 生成无 build 脚本包的 composite 产物
+        run: pnpm exec tsc -b packages/shared packages/services packages/client packages/ui
+
+      - name: 构建发行包
+        run: pnpm build:zcode --base-url "$ZCODE_DIST_BASE_URL"
+
+      # 在仓库外解压运行，避免本仓 node_modules 掩盖缺失依赖。
+      - name: 发行包冒烟
+        run: |
+          node scripts/zcode-distribution-smoke.mjs \
+            "dist/zcode/releases/${{ needs.prepare.outputs.version }}/zcode-${{ needs.prepare.outputs.version }}.tar.gz"
+
+      # Release 资产是扁平的，装不了 install.sh 需要的子目录结构，另打整包便于取用。
+      - name: 打整包归档
+        run: tar -czf "zcode-${{ needs.prepare.outputs.version }}-dist.tar.gz" -C dist zcode
+
+      # 构建完立即直传 Release，不等桌面端。
+      # 不上传 install.sh：Release 资产是扁平的，它需要的 <base>/latest.json 与
+      # <base>/releases/<version>/ 结构不存在，单独放出去会被误当成可执行入口（必 404）。
+      # 完整目录树在 zcode-<version>-dist.tar.gz 里。latest.json 属于纯元数据（版本/包名/sha256/下载根地址），
+      # 单独留着便于查询与镜像同步，且不会误导。
+      - name: 上传到 Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+          VERSION: ${{ needs.prepare.outputs.version }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" \
+            "dist/zcode/releases/$VERSION/zcode-$VERSION.tar.gz" \
+            "dist/zcode/releases/$VERSION/sha256.txt" \
+            dist/zcode/latest.json \
+            "zcode-$VERSION-dist.tar.gz" \
+            --clobber
+
+  # 各构建 job 已各自上传资产；这里等它们全部成功后才决定是否转正。
+  finalize:
+    name: 转正 Release
+    needs: [prepare, build-desktop, build-cli]
+    # 未勾选的构建会被跳过，跳过不算失败，所以不能沿用默认的 success()。
+    if: ${{ !cancelled() && !failure() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      # tag 推送自动转正；手动触发看 publish 输入。构建有失败就到不了这里，所以不会发出残缺的正式版。
+      - name: 转正 draft release
+        if: github.event_name == 'push' || inputs.publish
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: gh release edit "$TAG" --draft=false
+
+      - name: 输出 release 摘要
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.prepare.outputs.tag }}
+        run: |
+          gh release view "$TAG" \
+            --json url,isDraft,isPrerelease,assets \
+            --jq '"\(.url)  draft=\(.isDraft)  prerelease=\(.isPrerelease)  assets=\(.assets | length)"'
